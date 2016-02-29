@@ -7,6 +7,7 @@ import theano.tensor as T
 import matplotlib
 import numpy as np
 import matplotlib.pyplot as plt
+from IPython import display
 import cPickle
 
 from fuel.datasets import IndexableDataset
@@ -14,68 +15,18 @@ from fuel.schemes import ShuffledScheme, SequentialScheme
 from fuel.streams import DataStream
 
 from collections import OrderedDict
+import h5py
+
+from fuel.datasets import H5PYDataset
+from fuel.converters.base import fill_hdf5_file
 
 spth = '/misc/data15/reco/bhattgau/Rnn/projects/Rvector/Weights/basic-softmax'
-
-def load_dataset():
-    
-    f1 = open('/misc/data15/reco/bhattgau/Rnn/lists/spk_softmax/Train_feats_labs.plst')
-    lines = f1.readlines()
-    lines = [l.strip() for l in lines]
-    labelz = [int(l.split()[1]) for l in lines] 
-    #labelz = labelz[:20]
-    features = [l.split()[0] for l in lines] 
-    
-    f2 = open('/misc/data15/reco/bhattgau/Rnn/lists/spk_softmax/Valid_feats_labs.plst')
-    lines = f2.readlines()
-    lines = [l.strip() for l in lines]
-    val_labelz = [int(l.split()[1]) for l in lines] 
-    #val_labelz = val_labelz[:20]
-    val_features = [l.split()[0] for l in lines] 
-    
-    n_samp = len(features)
-    maxlen=800 #pad all utterances to this length
-    feat_dim=20
-    nSpk = 98
-    dpth = '/misc/data15/reco/bhattgau/Rnn/Data/mfcc/Nobackup/VQ_VAD_HO_EPD/'
-
-    Data = np.zeros((n_samp, maxlen, feat_dim), dtype='float32')
-    Mask = np.zeros((n_samp,maxlen), dtype='float32')
-    #Targets = np.zeros((n_samp, nSpk), dtype='int32')
-    
-    vn_samp = len(val_features)
-    val_Data = np.zeros((vn_samp, maxlen, feat_dim), dtype='float32')
-    val_Mask = np.zeros((vn_samp,maxlen), dtype='float32')
-    #Targets = np.zeros((n_samp, nSpk), dtype='int32')
-
-    for ind,f in enumerate(features):
-        fname = os.path.join(dpth,f+'.fea')
-        fi = htkmfc.HTKFeat_read(fname)
-        data = fi.getall()[:,:20]
-        Mask[ind,:data.shape[0]] = 1.0
-        pad = maxlen - data.shape[0]
-        data = np.vstack((data, np.zeros((pad,20), dtype='float32')))
-        Data[ind,:,:] = data
-        
-
-    for ind,f in enumerate(val_features):
-        fname = os.path.join(dpth,f+'.fea')
-        fi = htkmfc.HTKFeat_read(fname)
-        data = fi.getall()[:,:20]
-        val_Mask[ind,:data.shape[0]] = 1.0
-        pad = maxlen - data.shape[0]
-        data = np.vstack((data, np.zeros((pad,20), dtype='float32')))
-        val_Data[ind,:,:] = data
-
-
-    return Data, Mask, np.asarray(labelz, dtype='int32'), val_Data, val_Mask, np.asarray(val_labelz, dtype='int32')
-
 
 # Min/max sequence length
 MAX_LENGTH = 800
 # Number of units in the hidden (recurrent) layer
-N_HIDDEN = 100
-F_DIM = 20
+N_HIDDEN = 400
+F_DIM = 60
 # Number of training sequences ain each batch
 N_BATCH = 1
 # Optimization learning rate
@@ -86,8 +37,8 @@ GRAD_CLIP = 100
 EPOCH_SIZE = 100
 # Number of epochs to train the net
 NUM_EPOCHS = 10
-
-nSpk = 98
+BATCH_SIZE = 5
+nSpk = 194
 
 X = T.tensor3(name='input',dtype='float32')
 Mask = T.matrix(name = 'mask', dtype='float32')
@@ -193,45 +144,40 @@ for param in all_parameters:
 print("-"*40)
 #add grad clipping to avoid exploding gradients
 all_grads = [T.clip(g,-5,5) for g in T.grad(mean_cost, all_parameters)]
-all_grads = lasagne.updates.total_norm_constraint(all_grads,5)
+all_grads = lasagne.updates.total_norm_constraint(all_grads,3)
 
-updates = lasagne.updates.adam(all_grads, all_parameters, learning_rate=0.001)
+updates = lasagne.updates.adam(all_grads, all_parameters, learning_rate=0.005)
 
 train_func = theano.function([X, Mask, labels], [mean_cost, train_acc], updates=updates)
 
 val_func = theano.function([X, Mask, labels], [val_mcost, val_acc])
+#Get parameters of both encoder and decoder
 
-
-#load the dataset
-Data, Msk, Targets, val_Data, val_Msk, val_tars = load_dataset()
-
-train_set = IndexableDataset(
-    indexables = OrderedDict([('features', Data), ('mask',Msk), ('targets', Targets)]), 
-    axis_labels={'features':('batch','maxlen','feat_dim'),'mask':('batch','maxlen'), 'targets':('batch','index')})
-
-valid_set = IndexableDataset(
-    indexables = OrderedDict([('features', val_Data), ('mask', val_Msk), ('targets', val_tars)]), 
-    axis_labels={'features':('batch','maxlen','feat_dim'),'mask':('batch','maxlen'), 'targets':('batch','index')})
-
-num_epochs=5
+num_epochs=500
 epoch=0
 
-print("Starting training...")
-    # We iterate over epochs:
+train_set = H5PYDataset('/misc/data15/reco/bhattgau/Rnn/lists/rsr/rsr_train3.hdf5', 
+                        which_sets=('train',), subset=slice(0,30000))
+valid_set = H5PYDataset('/misc/data15/reco/bhattgau/Rnn/lists/rsr/rsr_train3.hdf5',
+                        which_sets=('test',), subset=slice(0,2000))
+
+trainerr=[]
+
 val_prev = np.inf
 a_prev = -np.inf
 
+print("Starting training...")
+    # We iterate over epochs:
 while 'true':
-#for epoch in range(num_epochs):
     # In each epoch, we do a full pass over the training data:
     train_err = 0
     tr_acc = 0
     train_batches = 0
     
-    t_state = train_set.open()
-    v_state = valid_set.open()
+    h1=train_set.open()
+    h2=valid_set.open()
 
-    scheme = ShuffledScheme(examples=train_set.num_examples, batch_size=128)
+    scheme = ShuffledScheme(examples=train_set.num_examples, batch_size=256)
     scheme1 = SequentialScheme(examples=valid_set.num_examples, batch_size=128)
 
 
@@ -241,7 +187,7 @@ while 'true':
     start_time = time.time()
     
     for data in train_stream.get_epoch_iterator():
-        t_data, t_mask, t_labs = data
+        t_data, t_mask, _, t_labs = data
         terr, tacc = train_func(t_data, t_mask, t_labs)
         train_err += terr
         tr_acc += tacc
@@ -252,17 +198,20 @@ while 'true':
     val_batches = 0
     
     for data in valid_stream.get_epoch_iterator():
-        v_data, v_mask, v_tars = data
+        v_data, v_mask, _, v_tars = data
         err, acc = val_func(v_data, v_mask ,v_tars)
         val_err += err
         val_acc += acc
         val_batches += 1
+        
+    trainerr.append(train_err/train_batches)
     
     epoch+=1
-    #f_log = open('/misc/data15/reco/bhattgau/Rnn/Projects/Rvector/Weights/training.log','a')
-
-# Then we print the results for this epoch:
-    flog1 = open('/misc/data15/reco/bhattgau/Rnn/projects/Rvector/Weights/basic-softmax/Atrain1.log','ab')
+    train_set.close(h1)
+    valid_set.close(h2)
+    
+        
+    flog1 = open('/misc/data15/reco/bhattgau/Rnn/projects/Rvector/Weights/basic-softmax/Atrain_attn_rsr1.log','ab')
 
     flog1.write("Epoch {} of {} took {:.3f}s\n ".format(
     epoch, num_epochs, time.time() - start_time))
@@ -274,23 +223,21 @@ while 'true':
         val_acc / val_batches * 100))
     flog1.write("\n")
     flog1.close()
-   
+    
+    max_val = a_prev
     valE = val_err/val_batches
     valA = val_acc / val_batches
     
-    #save the max accuracy model
-    max_val = a_prev
-    
     if epoch == num_epochs:
-      break
+        break
     #save model with highest accuracy
     if valA > max_val:
         
         model_params1 = lasagne.layers.get_all_param_values(l_attention)
         model_params2 = lasagne.layers.get_all_param_values(l_Spk_softmax)
 
-        model1_name = 'Attn_acc' + '.pkl'
-        model2_name = 'Attn_accB' + '.pkl'
+        model1_name = 'rsr_Attn_acc' + '.pkl'
+        model2_name = 'rsr_Attn_accB' + '.pkl'
 
         vpth1 = os.path.join(spth, model1_name)
         vpth2 = os.path.join(spth, model2_name)
@@ -314,8 +261,8 @@ while 'true':
         model_params1 = lasagne.layers.get_all_param_values(l_attention)
         model_params2 = lasagne.layers.get_all_param_values(l_Spk_softmax)
 
-        model1_name = 'Attn_ofit'  + '.pkl'
-        model2_name = 'Attn_ofitB' + '.pkl'
+        model1_name = 'rsr_Attn_ofit'  + '.pkl'
+        model2_name = 'rsr_Attn_ofitB' + '.pkl'
 
         vpth1 = os.path.join(spth, model1_name)
         vpth2 = os.path.join(spth, model2_name)
@@ -334,10 +281,7 @@ while 'true':
         c=0
         val_prev=valE
     
-    if c==8:
-        break
-    
-    if epoch==num_epochs:
+    if c==5:
         break
         
 #Save the final model
@@ -347,8 +291,8 @@ print('Saving Model ...')
 model_params1 = lasagne.layers.get_all_param_values(l_attention)
 model_params2 = lasagne.layers.get_all_param_values(l_Spk_softmax)
 
-model1_name = 'Attn_softmax_final' + '.pkl'
-model2_name = 'Attn_softmax_final' + '.pkl'
+model1_name = 'Attn_softmax_rsr' + '.pkl'
+model2_name = 'Attn_softmax_rsr' + '.pkl'
 
 vpth1 = os.path.join(spth, model1_name)
 vpth2 = os.path.join(spth, model2_name)
